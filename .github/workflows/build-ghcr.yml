@@ -246,62 +246,92 @@ jobs:
           fi
           echo "pruning versions of package '$package' (image $image)"
 
-          # Which version to keep is decided by TAG, never by position.
+          # List every version with its id, its digest (`.name`), and its tags.
           #
-          # The first version of this step sorted by id descending and deleted
-          # everything but row 1. That is wrong twice over: GHCR version ids are
-          # opaque integers with no documented ordering, so "highest id == newest"
-          # is a guess; and the one version that matters is the one carrying the
-          # `latest` tag, which is exactly the version that must survive. Deleting
-          # it leaves `latest` pointing at nothing, and the verify job then fails
-          # with `manifest unknown` — a message that names no cause, because the
-          # push and the deletion both "succeeded".
+          # The shape matters and is easy to get wrong: a version has an integer
+          # `id` and a `name` that IS the manifest digest, `sha256:...`. They are
+          # different values, and the DELETE endpoint takes the `id`. So the digest
+          # from the tag step is matched against `.name`, and the numeric `id` is
+          # what gets deleted — which is exactly how the Radicale workflow does it.
           gh api -H "Accept: application/vnd.github+json" \
             "/user/packages/container/${package}/versions" --paginate \
-            --jq '.[] | [.id, (.metadata.container.tags // [] | join(","))] | @tsv' \
-            > /tmp/versions.tsv
+            --jq '.[] | [.id, (.name // ""), (.metadata.container.tags // [] | join(","))] | @tsv' \
+            > /tmp/versions.tsv || true
 
-          total=$(wc -l < /tmp/versions.tsv)
-          echo "registry holds $total version(s)"
+          total=$(wc -l < /tmp/versions.tsv || echo 0)
+          echo "registry reports $total version(s)"
 
-          # The version carrying KEEP_TAG is the one to preserve.
+          # If the API gave us nothing, do nothing. An empty list right after a
+          # push is a lagging read, not an empty registry — deleting on that
+          # reading would be catastrophic, and skipping it costs one nightly.
+          if [ "$total" -eq 0 ] || [ ! -s /tmp/versions.tsv ]; then
+            echo "::warning::the versions API returned nothing; skipping the prune this run rather than guess"
+            exit 0
+          fi
+          awk -F'\t' '{printf "  id=%s digest=%s tags=%s\n", $1, substr($2,1,19), ($3==""?"(untagged)":$3)}' /tmp/versions.tsv
+
+          # The version that was just published is protected by DIGEST.
+          # `metadata-action` exposes it as an output, and docker/build-push-action
+          # pushes it — so this is knowable locally, with no read-back and no race.
+          # It is the one version that must survive no matter what the API reports.
+          keep_digest="${{ steps.tags.outputs.digest }}"
+          if [ -n "$keep_digest" ]; then
+            echo "protecting the version just published (digest ${keep_digest:0:19}…)"
+          else
+            # No digest available: fall back to the tag lookup, but say so. A
+            # silent fallback is how a race gets missed.
+            echo "::warning::no digest from the tag step; falling back to the tag lookup only"
+            keep_digest=""
+          fi
+
+          # Which version carries KEEP_TAG — the fallback, and what the log reports.
+          # Note this reads the TAGS column ($3), not the digest column.
           keep_id=$(awk -F'\t' -v want="$KEEP_TAG" \
-            'BEGIN{FS="\t"} { n=split($2, a, ","); for (i=1;i<=n;i++) if (a[i]==want) { print $1; exit } }' \
+            'BEGIN{FS="\t"} { n=split($3, a, ","); for (i=1;i<=n;i++) if (a[i]==want) { print $1; exit } }' \
             /tmp/versions.tsv)
-          if [ -z "$keep_id" ]; then
-            # Nothing is tagged. That is a broken state, not a cleanup opportunity:
-            # if we started deleting now we could remove the only copy.
-            echo "::error::no version carries the '$KEEP_TAG' tag — refusing to prune, because the publish is broken" >&2
-            awk -F'\t' '{print "  id="$1" tags="$2}' /tmp/versions.tsv
+          if [ -z "$keep_id" ] && [ -z "$keep_digest" ]; then
+            # Nothing is tagged and no digest is known. That is a broken state,
+            # not a cleanup opportunity: deleting now could remove the only copy.
+            echo "::error::no version carries the '$KEEP_TAG' tag and no digest is known — refusing to prune" >&2
+            awk -F'\t' '{print "  id="$1" digest="$2" tags="$3}' /tmp/versions.tsv
             exit 1
           fi
-          echo "keeping version $keep_id (tagged '$KEEP_TAG')"
+          echo "keeping version ${keep_id:-by digest} (tagged '$KEEP_TAG')"
 
           deleted=0
           failed=0
-          while IFS=$'\t' read -r id tags; do
+          # Three columns: id, digest, tags.
+          while IFS=$'\t' read -r id digest tags; do
             [ -n "$id" ] || continue
-            [ "$id" = "$keep_id" ] && continue
-            # Belt and braces: never delete a version that still carries ANY tag,
-            # even if it is not the one we are keeping. A tagged version is one
-            # somebody may be pulling deliberately.
+            # 1. The version just published. Protected by digest, unconditionally.
+            #    This is the case the digest exists for: it is the one version the
+            #    registry may not have indexed yet, and therefore the one a
+            #    tag-based lookup would miss and a blind prune would delete.
+            if [ -n "$keep_digest" ] && [ "$digest" = "$keep_digest" ]; then
+              echo "keeping version $id (the digest just published)"
+              continue
+            fi
+            # 2. The version the keep tag points at, when the API has caught up and
+            #    the tag has moved to the new digest.
+            [ -n "$keep_id" ] && [ "$id" = "$keep_id" ] && continue
+            # 3. Any version carrying any tag. Somebody may be pulling it
+            #    deliberately, and a tag is evidence the version is intended.
             if [ -n "$tags" ]; then
               echo "::warning::version $id is tagged ($tags) — leaving it alone; only untagged versions are pruned"
               failed=$((failed + 1))
               continue
             fi
+            # 4. Everything else: untagged, and not the version just published.
             if gh api -X DELETE -H "Accept: application/vnd.github+json" \
                  "/user/packages/container/${package}/versions/$id" >/dev/null 2>&1; then
               deleted=$((deleted + 1))
               echo "deleted version $id"
             else
               failed=$((failed + 1))
-              # A deletion that fails must not fail the build: losing a green run
-              # to a cleanup step is worse than one stale version surviving.
               echo "::warning::could not delete version $id (already gone, or not deletable)"
             fi
           done < /tmp/versions.tsv
-          echo "pruned $deleted version(s), kept 1 ($KEEP_TAG); $failed left in place"
+          echo "pruned $deleted version(s); $failed left in place"
 
       - name: Record what was published
         run: |
@@ -330,7 +360,26 @@ jobs:
       contents: read
     steps:
       - name: Pull the image just pushed
-        run: docker pull ${{ needs.resolve.outputs.image }}:latest
+        run: |
+          # Pull without logging in — the package is public, and pulling
+          # anonymously is what a fresh user does, so it is the honest test.
+          #
+          # It retries, because GHCR's read path lags its write path: the push
+          # reports success and the manifest can still answer `manifest unknown`
+          # for a few seconds. That is not a broken image, and failing a green
+          # build over it is noise. The wait is bounded, so a genuinely missing
+          # tag still fails.
+          image="${{ needs.resolve.outputs.image }}:latest"
+          for attempt in $(seq 1 12); do
+            if docker pull "$image"; then
+              echo "pulled $image on attempt $attempt"
+              exit 0
+            fi
+            echo "attempt $attempt failed; the registry may still be indexing — retrying in 10s"
+            sleep 10
+          done
+          echo "::error::could not pull $image after 12 attempts" >&2
+          exit 1
 
       - name: Start the container
         run: |
