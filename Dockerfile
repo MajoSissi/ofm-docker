@@ -232,7 +232,20 @@ COPY --from=source --chown=node:node /src/.upstream-commit   /app/.upstream-comm
 
 # The container entrypoint. Written here so it is versioned with the image
 # rather than re-derived at run time.
-COPY --chown=node:node docker/entrypoint.sh /usr/local/bin/ofm-entrypoint.sh
+#
+# `--chmod=0755` matters more than it looks. The file carries a `#!/bin/sh`
+# shebang and the ENTRYPOINT below is `["/sbin/tini", "--", "/usr/local/bin/ofm-
+# entrypoint.sh"]`, so it is *executed*, not passed to `sh -c`. Without the exec
+# bit the container dies immediately with "permission denied", and the CI verify
+# job then reports the *next* step failing with `No such container: ofm-verify` —
+# an error that points nowhere near the real cause.
+#
+# Docker's COPY --chmod sets the bit inside the image regardless of how git
+# recorded the file, so this is safe against a checkout on Windows (where the
+# exec bit is not recorded at all) and against a `git update-index --chmod=+x`
+# nobody remembered. Run `git ls-files -s docker/entrypoint.sh` if you want to
+# double-check from the repo side: it should read 100755.
+COPY --chmod=0755 --chown=node:node docker/entrypoint.sh /usr/local/bin/ofm-entrypoint.sh
 
 # The service is a daemon: it must own its data directory, and it must not run
 # as root. /data is a volume mount point. Sticky-bit-free: only the service

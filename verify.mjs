@@ -278,12 +278,55 @@ const logical = []
   else ok('the engine check compares major and minor versions')
 }
 
-// ---------------------------------------------------- 5. workflow -------
+// ---------------------------------------------------- 5. the entrypoint --
+// The ENTRYPOINT executes docker/entrypoint.sh, so it must be executable *in the
+// image*. Git does not reliably carry the exec bit across a Windows checkout, and
+// the first build with mode 100644 produced a container that died instantly with
+// "permission denied" — which CI reported two steps later as
+// `No such container: ofm-verify`, an error naming no cause.
+//
+// Two independent guards, because either one alone can be defeated:
+//   a) the COPY must set --chmod=0755, so the image is right regardless of git;
+//   b) the repo's own recorded mode should be 100755, so a contributor reading
+//      the tree sees the intent.
+console.log('\n=== 5. the entrypoint must be executable ===')
+{
+  const df = fs.readFileSync('Dockerfile', 'utf8')
+  const copyRe = /^COPY\s+(?:--chmod=(\d+)\s+)?(?:--chown=[^\s]+\s+)?.*docker\/entrypoint\.sh\s+(\/\S+)/m
+  const m = df.match(copyRe)
+  if (!m) fail('the Dockerfile does not COPY docker/entrypoint.sh')
+  else if (!m[1] || m[1] !== '0755') {
+    fail(`the entrypoint COPY sets no executable mode (got ${m[1] ?? 'none'}) — add --chmod=0755`)
+  } else ok('the entrypoint is COPY\'d with --chmod=0755, so it is executable in the image')
+
+  // The shebang must be on line 1, or the exec fails even with the bit set.
+  const first = fs.readFileSync('docker/entrypoint.sh', 'utf8').split('\n')[0]
+  first === '#!/bin/sh' ? ok('the entrypoint starts with #!/bin/sh on line 1')
+    : fail('the entrypoint does not start with "#!/bin/sh" (found: ' + JSON.stringify(first) + ')')
+
+  // The ENTRYPOINT must exec it, not try to interpret it as a node argument.
+  if (/ENTRYPOINT\s+\[[^\]]*entrypoint\.sh/.test(df)) ok('the ENTRYPOINT invokes the entrypoint script')
+  else fail('the ENTRYPOINT does not invoke the entrypoint script')
+
+  // What git recorded. Read-only check; the Dockerfile guard above is the one
+  // that actually protects the image, so a failure here is advisory.
+  try {
+    const { execFileSync } = await import('node:child_process')
+    const modes = execFileSync('git', ['ls-files', '-s', 'docker/entrypoint.sh'], { encoding: 'utf8' }).trim()
+    const mode = modes.split(/\s+/)[0]
+    mode === '100755' ? ok('git records the entrypoint as 100755 (executable)')
+      : console.log(`  · git records it as ${mode}; run \`git update-index --chmod=+x docker/entrypoint.sh\` — the image is safe either way thanks to --chmod=0755`)
+  } catch {
+    console.log('  · git not available; the Dockerfile --chmod guard is what protects the image')
+  }
+}
+
+// ---------------------------------------------------- 6. workflow -------
 // Load both files: some assertions belong to the workflow (triggers, registry,
 // platform), and some to the Dockerfile (immutable upstream fetch). Checking
 // the wrong file for a Dockerfile-only contract is a real bug — the assertion
 // would silently pass for the wrong reason or fail for the right one.
-console.log('\n=== 5. workflow contract ===')
+console.log('\n=== 6. workflow contract ===')
 const wfPath = '.github/workflows/build-ghcr.yml'
 if (!fs.existsSync(wfPath)) fail('workflow missing at ' + wfPath)
 else {

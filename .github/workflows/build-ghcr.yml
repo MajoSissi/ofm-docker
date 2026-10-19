@@ -20,7 +20,7 @@ on:
   schedule:
     # 02:00 UTC daily = 10:00 Asia/Shanghai. Staggered so it does not land on
     # the hour, when GitHub's scheduler is most congested.
-    - cron: '17 2 * * *'
+    - cron: '0 0 * * *'
   workflow_dispatch:
     inputs:
       upstream_ref:
@@ -216,20 +216,53 @@ jobs:
       - name: Start the container
         run: |
           # No -p: nothing outside is exposed on purpose. The LAN relay port is
-          # discovered from the log and forwarded for the duration of the test.
+          # discovered at runtime; see the README.
           docker run -d --name ofm-verify \
             -e OFM_HOME=/data \
             -v ofm-verify-data:/data \
             --rm "${{ needs.resolve.outputs.image }}:latest"
-          echo "waiting for the service to write its settings..."
+
+          # `docker run -d` returns as soon as the container *starts*, not when
+          # it is *running*. A container whose ENTRYPOINT cannot execute — a
+          # missing exec bit on the entrypoint script is the case that actually
+          # happened — exits in milliseconds, and the failure only shows up at
+          # the NEXT step as `No such container: ofm-verify`, which names no
+          # cause at all. So assert liveness here, and dump the log if it died.
+          # Without this the error below is actively misleading.
+          alive=false
+          for i in $(seq 1 30); do
+            state=$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' ofm-verify 2>/dev/null || echo "gone")
+            case "$state" in
+              running*) alive=true; break ;;
+              "exited "*|"created "*|"dead "*)
+                echo "::error::the container is not running — state is '$state'"
+                echo "--- container log ---"
+                docker logs ofm-verify 2>&1 | tail -40 || true
+                echo "--- image entrypoint ---"
+                docker inspect -f '{{json .Config.Entrypoint}}' "${{ needs.resolve.outputs.image }}:latest"
+                exit 1
+                ;;
+            esac
+            sleep 1
+          done
+          if [ "$alive" != true ]; then
+            echo "::error::the container never reached a running state"
+            echo "--- container log ---"
+            docker logs ofm-verify 2>&1 | tail -40 || true
+            exit 1
+          fi
+          echo "container is running; waiting for the service to write its settings..."
           for i in $(seq 1 60); do
             if docker exec ofm-verify sh -c 'test -f "$OFM_HOME/settings.json"' 2>/dev/null; then
-              break
+              echo "settings.json present after ${i} checks"
+              exit 0
             fi
             sleep 2
           done
+          echo "::error::the service never wrote $OFM_HOME/settings.json"
           echo "--- container log ---"
-          docker logs ofm-verify 2>&1 | tail -30 || true
+          docker logs ofm-verify 2>&1 | tail -40 || true
+          exit 1
 
       - name: Assert /health answers on the loopback listener
         run: |

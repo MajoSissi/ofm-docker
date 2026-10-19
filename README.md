@@ -323,17 +323,27 @@ What that does, and why each step exists:
 | step | what it proves |
 |---|---|
 | `download.mjs` | fetches the upstream tree the image builds from, and resolves the ref to an immutable SHA first (same as the build) |
-| `verify.mjs` | walks the real ESM import graph to build the runtime inventory; confirms every Dockerfile deletion is safe; **builds the pruned tree and boots the real service from it**, asserting `/health` 200, keyed models 200, anonymous 401, management 404; and a real completion attempt through the relay (see *The free lane depends on your network exit*) |
+| `verify.mjs` | walks the real ESM import graph to build the runtime inventory; confirms every Dockerfile deletion is safe; **builds the pruned tree and boots the real service from it**, asserting `/health` 200, keyed models 200, anonymous 401, management 404; a real completion attempt through the relay (see *The free lane depends on your network exit*); **every `node` call sits in a node-based stage**, with the engine-check boundaries; **the entrypoint is COPY'd `--chmod=0755` and git records it executable**; and the workflow's triggers, permissions, platform and SHA pin |
 | `run-workflow-verify.mjs` | **extracts the verify script out of the workflow and runs it** — the first draft of that script mixed `require` with top-level `await` and failed to parse, and its port came from `settings.json` instead of the live service; both bugs would have surfaced in CI and nowhere else |
+| `test-verify-discriminates.mjs` | proves `verify.mjs` *catches* the entrypoint bug rather than merely passing on the fixed tree — it replays the broken `COPY` and asserts the check fails on it |
 | `test-entrypoint-helpers.mjs` | the entrypoint's `ofm_setting` / `ofm_relay_port` helpers against the real service, including the persisted-port trap above |
 
-`verify.mjs` also asserts the workflow contract, so a change that drops the
-daily trigger or the AMD64 pin fails locally rather than after a silent nightly.
+Every check maps to something that actually broke:
+
+| check | the bug it caught |
+|---|---|
+| node calls only in node stages | `exit 127`: `node` invoked in a `FROM alpine` stage with no node |
+|完整 runtime inventory | `registry.json` deleted — read through a variable, invisible to import graphs, crashed at module load |
+| workflow verify script is executed | `require` + top-level `await` could not parse; read a LAN port of `0` |
+| entrypoint is executable | entrypoint committed mode `100644`; the container died instantly and CI blamed the *next* step with `No such container` |
+| pruned tree boots | two missing files that static inspection had called fine |
 
 > These run without Docker. In the development environment there was no Docker
 > daemon, which is why the *pruned tree boots the real service* check exists —
-> it is the closest available substitute for `docker build && docker run`, and it
-> caught two missing-file bugs that static inspection had declared fine.
+> it is the closest available substitute for `docker build && docker run`. It
+> cannot reproduce a build-time failure the way a real build can (that is how
+> `exit 127` and the exec-bit bug both reached CI), so the first CI run on a
+> packaging change is still the definitive test.
 
 ---
 
