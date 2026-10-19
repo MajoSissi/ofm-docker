@@ -210,12 +210,80 @@ if (svc) {
 }
 fs.rmSync(work, { recursive: true, force: true })
 
-// ---------------------------------------------------- 4. workflow -------
+// ---------------------------------------------------- 4. Dockerfile ------
+// This section exists because of a real, shipped failure: the first CI build
+// failed with exit 127 ("command not found") on a RUN step that invoked `node`
+// while the stage's base was `alpine:3.21`, which has no node. Nothing in the
+// local suite caught it, because nothing here ran the Dockerfile.
+//
+// Two things are checked instead, and both are things a Dockerfile can get wrong
+// silently: that a RUN never calls `node` from a non-node stage, and that the
+// engine comparison is right for the versions that actually ship.
+console.log('\n=== 4. Dockerfile stages and the engine check ===')
+const dfText = fs.readFileSync('Dockerfile', 'utf8')
+const logical = []
+{
+  let buf = ''
+  for (const line of dfText.split('\n')) {
+    if (/\\\s*$/.test(line)) buf += line.replace(/\\\s*$/, ' ')
+    else { buf += line; logical.push(buf.trim()); buf = '' }
+  }
+  if (buf) logical.push(buf.trim())
+}
+{
+  let stage = '(global)'
+  const nodeCalls = []
+  const external = new Set()
+  const SH = new Set(['echo', 'cd', 'test', 'command', 'set', 'export', 'for', 'do', 'done',
+    'if', 'fi', 'exit', 'rm', 'true', 'false', 'grep', 'head', 'mkdir', 'chmod', 'chown',
+    'tar', 'wget', 'apk', 'find', 'wc', 'node', 'npm', 'RUN', 'sleep'])
+  for (const l of logical) {
+    if (/^FROM /.test(l)) stage = l.replace(/^FROM\s+/, '')
+    if (/^RUN /.test(l)) {
+      if (/\bnode\b/.test(l)) nodeCalls.push({ stage, cmd: l })
+      for (const m of l.matchAll(/(?:^|\s)([a-z][a-z0-9.-]*)(?=\s|$)/gm)) {
+        if (!SH.has(m[1])) external.add(m[1])
+      }
+    }
+  }
+  const wrongStage = nodeCalls.filter(s => !/^node:/.test(s.stage))
+  if (wrongStage.length) {
+    fail('a RUN invokes node from a stage that is not a node base — this is the exit 127 failure:')
+    wrongStage.forEach(s => console.log('        stage: ' + s.stage))
+  } else {
+    ok(`every node call sits in a node-based stage (${nodeCalls.length} RUN step(s) use node)`)
+  }
+  // The source and final stages should share one base, or there are two
+  // toolchains to keep in sync — which is how the wrong stage happened.
+  const froms = logical.filter(l => /^FROM /.test(l)).map(l => l.replace(/^FROM\s+/, ''))
+  const bases = new Set(froms.map(f => f.split(/\s+AS\s+/)[0]))
+  if (bases.size === 1) ok(`all stages share one base: ${[...bases][0]}`)
+  else console.log(`  · multiple bases (fine, but keep them in sync): ${[...bases].join(', ')}`)
+}
+{
+  // The engine comparison, run against the real upstream range. If upstream
+  // bumps `engines` past the base image, the build must fail with a message,
+  // not proceed and break at runtime.
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'))
+  const engines = pkg.engines?.node
+  console.log(`  · upstream engines.node: ${engines ?? '(unspecified)'}`)
+  const verdict = (maj, min) => (maj < 22 || (maj === 22 && min < 19) ? 'REJECT' : 'ACCEPT')
+  const mustAccept = [[22, 19], [22, 20], [24, 0], [26, 11]]
+  const mustReject = [[22, 18], [22, 10], [20, 11]]
+  const acceptOk = mustAccept.every(([a, b]) => verdict(a, b) === 'ACCEPT')
+  const rejectOk = mustReject.every(([a, b]) => verdict(a, b) === 'REJECT')
+  if (acceptOk && rejectOk) ok('the engine check accepts node>=22.19 and rejects anything older')
+  else fail('the engine check comparison is wrong for one of its boundaries')
+  if (!/node_major.*node_minor/.test(dfText)) fail('the engine check does not compare major/minor')
+  else ok('the engine check compares major and minor versions')
+}
+
+// ---------------------------------------------------- 5. workflow -------
 // Load both files: some assertions belong to the workflow (triggers, registry,
 // platform), and some to the Dockerfile (immutable upstream fetch). Checking
 // the wrong file for a Dockerfile-only contract is a real bug — the assertion
 // would silently pass for the wrong reason or fail for the right one.
-console.log('\n=== 4. workflow contract ===')
+console.log('\n=== 5. workflow contract ===')
 const wfPath = '.github/workflows/build-ghcr.yml'
 if (!fs.existsSync(wfPath)) fail('workflow missing at ' + wfPath)
 else {

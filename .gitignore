@@ -18,3 +18,6 @@ verify-in-container.cjs
 .vscode/
 .DS_Store
 Thumbs.db
+
+# YAML parser installed only to validate the workflow locally
+.tools/

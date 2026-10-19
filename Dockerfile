@@ -45,7 +45,16 @@ ARG TARGETPLATFORM
 # ---------------------------------------------------------------- source ---
 # Pinned to a single ref and recorded in the image, so an image is
 # reproducible and traceable to the upstream commit it was cut from.
-FROM alpine:3.21 AS source
+#
+# This stage is a NODE image, not a slim Alpine, and that is the whole fix for
+# the first build failure. The draft above used `FROM alpine:3.21` and then ran
+# `apk add ... tar` here — fine for fetching and extracting — but the engine check
+# below executes `node`, and base Alpine ships no node at all. Every build died
+# right there with exit 127, "command not found". Keeping the source stage on the
+# same node base the runtime uses means the fetch, the extraction, the engine
+# check and the prune all run in one base, with no second toolchain to keep in
+# sync, and the engine check can actually run.
+FROM node:${NODE_VERSION} AS source
 
 # TARGETPLATFORM is re-declared inside each stage that needs it; an ARG is
 # scoped to the stage that declares it. BuildKit injects it (e.g. linux/amd64);
@@ -55,7 +64,16 @@ ARG TARGETPLATFORM
 ARG UPSTREAM_REPO
 ARG UPSTREAM_REF
 
-RUN apk add --no-cache ca-certificates tar
+# The node Alpine images ship wget, tar and grep — everything the fetch step
+# needs — plus the system CA bundle for the TLS calls to GitHub. No extra
+# `apk add` here, which is what kept this stage thin.
+#
+# The guard below exists so the mistake that cost the first build cannot happen
+# again: running `node` in a stage whose base has none fails as exit 127
+# "command not found" only at *this* line, with a stack trace pointing at the
+# wrong place entirely.
+RUN command -v node >/dev/null && command -v wget >/dev/null && command -v tar >/dev/null \
+    || { echo 'fatal: the source stage needs node, wget and tar; use a node base image here'; exit 1; }
 
 # The GitHub API tarball URL is used rather than `git clone` so the build needs
 # no git config, no credential handling, and no protocol negotiation.
@@ -70,19 +88,19 @@ RUN set -eux; \
     test -f /src/packages/standalone/cli.mjs; \
     echo "$UPSTREAM_SHA" > /src/.upstream-commit
 
-# Verify the pinned Node engine requirement is still satisfied before building.
-# This catches the case where upstream bumps `engines` past our base image.
-RUN set -eux; \
-    node_version=$(node -e 'console.log(JSON.parse(require("fs").readFileSync("/src/package.json","utf8")).engines.node)'); \
-    echo "package.json engines.node: $node_version"; \
+# Verify the pinned Node engine requirement is still satisfied.
+#
+# It runs here, where node exists. The point is to catch upstream bumping
+# `engines` past this base: without it, a too-new upstream would build cleanly
+# and then fail at runtime with a syntax error that reads like a packaging bug.
+RUN set -eu; \
+    node_version=$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync("/src/package.json","utf8")).engines.node || "")'); \
     node_major=$(node -p 'process.versions.node.split(".")[0]'); \
     node_minor=$(node -p 'process.versions.node.split(".")[1]'); \
-    echo "build node: v$node_major.$node_minor"; \
-    if [ "$node_major" -eq 22 ] && [ "$node_minor" -lt 19 ]; then \
-      echo "fatal: node $node_version required, have v$node_major.$node_minor" >&2; exit 1; \
-    fi; \
-    if [ "$node_major" -lt 22 ]; then \
-      echo "fatal: node $node_version required, have v$node_major.$node_minor" >&2; exit 1; \
+    echo "upstream requires node ${node_version:-unspecified}; this stage has v$node_major.$node_minor"; \
+    if [ "$node_major" -lt 22 ] || { [ "$node_major" -eq 22 ] && [ "$node_minor" -lt 19 ]; }; then \
+      echo "fatal: upstream requires ${node_version:-node>=22.19} but the base image is v$node_major.$node_minor" >&2; \
+      exit 1; \
     fi
 
 # Drop everything the runtime does not need. Two reasons this is worth doing at
@@ -182,8 +200,16 @@ LABEL org.opencontainers.image.title="dsh-our-free-model" \
       com.our-free-model.upstream.ref="${UPSTREAM_REF}" \
       com.our-free-model.upstream.sha="${UPSTREAM_SHA}"
 
-# `--minimal` keeps node but drops npm: there is nothing to install at runtime,
-# and dropping npm shrinks the image and removes an attack surface.
+# `node:<ver>` (not the `-alpine` or `-minimal` variant) so that:
+#   * the source stage and the final stage are the same base, which is what let
+#     the engine check fail with exit 127 in the first draft — it ran `node` in a
+#     stage with no node;
+#   * npm is present. The image installs nothing, so npm is not strictly needed —
+#     but it is the tool an operator reaches for when something goes wrong at
+#     runtime, and keeping it costs ~100 MB of a ~700 MB base. The `-minimal`
+#     variant would trade that away for a smaller CVE surface; if you prefer the
+#     trade, set NODE_VERSION=22-minimal and note the entrypoint's diagnostic
+#     `node -e` calls still work, since those use node, not npm.
 ENV NODE_ENV=production \
     OFM_HOME=/data \
     OFM_PORT=18900 \
