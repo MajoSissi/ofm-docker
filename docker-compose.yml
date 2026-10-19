@@ -1,0 +1,58 @@
+# Our Free Model — standalone service in a container.
+#
+# Only the LAN relay is published. The plain service port is loopback-only by
+# upstream design and therefore cannot be published at all — see README.md,
+# "Ports, and the one that cannot be published".
+#
+# OFM_LAN_PORT is pinned to 18901 here so the published port and the relay's
+# own port are the same number. A fixed port that happens to be taken does not
+# stop the service: upstream degrades to `relayError` (surfaced on the summary
+# route and the CLI) and keeps serving inference locally, while `-p` simply
+# forwards to nothing.
+
+services:
+  our-free-model:
+    image: ghcr.io/${IMAGE_NAMESPACE:-owner}/dsh-our-free-model:latest
+    container_name: ofm
+    restart: unless-stopped
+    # Bound to loopback on purpose. Anyone who can hold the LAN key gets the
+    # free lanes from this machine's egress; publishing on 0.0.0.0 hands them
+    # to whoever can route to this host.
+    ports:
+      - "127.0.0.1:18901:18901"
+    environment:
+      OFM_HOME: /data
+      OFM_PORT: "18900"      # loopback only — never published
+      OFM_LAN_PORT: "18901"  # the relay, the only externally reachable port
+      OFM_ENABLE_REFRESH: "1"
+    volumes:
+      # Everything the service remembers: settings, the API key, the LAN key,
+      # cached model catalog, channel accounts, usage stats. Losing this
+      # loses the LAN key and every configured channel.
+      - ofm-data:/data
+    healthcheck:
+      # /health answers on the loopback listener from inside the container,
+      # which this container can always reach itself.
+      test:
+        - CMD
+        - node
+        - -e
+        - |
+          const p = process.env.OFM_PORT || 18900
+          require('http').get({ host: '127.0.0.1', port: p, path: '/health' },
+            r => process.exit(r.statusCode === 200 ? 0 : 1)
+          ).on('error', () => process.exit(1))
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging:
+      # The LAN key is printed once at first start, so the log is where an
+      # operator reads it from. Keep it out of public log sinks.
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  ofm-data:

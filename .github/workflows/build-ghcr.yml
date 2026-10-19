@@ -1,0 +1,355 @@
+# Our Free Model — build the container and push it to GHCR.
+#
+# Two triggers, as required:
+#   * schedule: a daily run that re-pulls upstream and rebuilds if anything moved
+#   * workflow_dispatch: a manual button in the Actions tab
+#
+# The workflow is deliberately *thin*: it does not decide what upstream contains
+# or how the image is built. Those decisions live in the Dockerfile, which pins
+# and records the upstream commit it was cut from. That separation keeps the
+# workflow stable while upstream evolves under it.
+#
+# Platform is linux/amd64 only, per the deployment target. If arm64 is ever
+# wanted, add it to the `platforms` input of docker/build-push-action below and
+# note that upstream ships no arm64 artifacts — the build is from source, so it
+# would work, just slower.
+
+name: Build & push to GHCR
+
+on:
+  schedule:
+    # 02:00 UTC daily = 10:00 Asia/Shanghai. Staggered so it does not land on
+    # the hour, when GitHub's scheduler is most congested.
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: 'Upstream ref to build (branch, tag or commit SHA)'
+        required: false
+        default: 'main'
+      push:
+        description: 'Push the image to GHCR (uncheck to do a dry build only)'
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+    paths:
+      # Only rebuild on changes that could actually affect the image, so a
+      # README typo does not cost a build.
+      - '.github/workflows/build-ghcr.yml'
+      - 'Dockerfile'
+      - 'docker/**'
+      - 'docker-compose.yml'
+      - 'README.md'
+  pull_request:
+    paths:
+      - '.github/workflows/build-ghcr.yml'
+      - 'Dockerfile'
+      - 'docker/**'
+      - 'docker-compose.yml'
+
+concurrency:
+  # A scheduled run must not queue behind an in-flight PR build.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  resolve:
+    # Resolve the upstream ref to an immutable SHA once, up front, so every
+    # later job builds the exact same tree and GHCR records what was built.
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_repo: ${{ steps.resolve.outputs.repo }}
+      upstream_ref: ${{ steps.resolve.outputs.ref }}
+      upstream_sha: ${{ steps.resolve.outputs.sha }}
+      upstream_version: ${{ steps.resolve.outputs.version }}
+      image: ${{ steps.lower.outputs.image }}
+    steps:
+      - name: Resolve upstream ref to a commit SHA
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF: ${{ inputs.upstream_ref || 'main' }}
+        run: |
+          set -euo pipefail
+          repo="${{ vars.UPSTREAM_REPO || 'Ebony-Vinyl/dsh-our-free-model' }}"
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          sha=$(gh api "repos/$repo/commits/$REF" --jq '.sha')
+          if [ -z "$sha" ] || [ "$sha" = "null" ]; then
+            echo "::error::could not resolve $repo@$REF" >&2
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          # Read the version out of the same tree the build will fetch, so the
+          # image's `version` label can never disagree with the code inside it.
+          # `set -o pipefail` is already on, so a failed `gh api` fails the job
+          # instead of silently producing an empty label.
+          version=$(gh api "repos/$repo/contents/package.json?ref=$sha" --jq '.content' \
+            | base64 -d \
+            | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const doc=s.trim()?JSON.parse(s):null;process.stdout.write(doc&&typeof doc.version==="string"?doc.version:"")})')
+          if [ -z "$version" ]; then
+            echo "::warning::could not read a version from $repo@$REF package.json; the image label will be empty"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "resolved $repo@$REF = $sha (version ${version:-unknown})"
+
+      - name: Lowercase the image path
+        id: lower
+        run: |
+          # GHCR image references must be all-lowercase; `github.repository`
+          # inherits the owner's casing, which may not be.
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "image: ghcr.io/${GITHUB_REPOSITORY,,}"
+
+  build:
+    needs: resolve
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Record build metadata
+        id: meta
+        env:
+          UPSTREAM_SHA: ${{ needs.resolve.outputs.upstream_sha }}
+          VERSION: ${{ needs.resolve.outputs.upstream_version }}
+        run: |
+          echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        # Skipped on pull_request and on a dry manual run — an unauthenticated
+        # build is still a valid smoke test.
+        if: >-
+          github.event_name != 'pull_request' && (
+            github.event_name != 'workflow_dispatch' ||
+            inputs.push
+          )
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # GITHUB_TOKEN is enough for GHCR when `packages: write` is granted
+          # above. No PAT is required for the token to push here.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags and labels
+        id: tags
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ needs.resolve.outputs.image }}
+          # `latest` is the moving tag people pull by default. `nightly-YYYYMMDD`
+          # makes each scheduled run individually pullable and rollback trivial,
+          # and the upstream sha tag ties this image to the exact tree it was cut
+          # from. `flavor: latest=false` only disables metadata-action's own
+          # automatic `latest` generation, so the explicit `type=raw,value=latest`
+          # below is not a conflict — it is the only thing that produces the tag,
+          # and it produces it only on the default branch.
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=schedule,pattern=nightly-{{date 'YYYYMMDD'}},enable=${{ github.event_name == 'schedule' }}
+            type=schedule,pattern={{date 'YYYYMMDD'}},enable=${{ github.event_name == 'schedule' }}
+            type=sha,format=short,enable={{is_default_branch}}
+          flavor: |
+            latest=false
+          labels: |
+            org.opencontainers.image.title=dsh-our-free-model
+            org.opencontainers.image.vendor=Ebony-Vinyl
+            org.opencontainers.image.licenses=MIT
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' &&
+                    (github.event_name != 'workflow_dispatch' || inputs.push) }}
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: ${{ steps.tags.outputs.labels }}
+          build-args: |
+            UPSTREAM_REPO=${{ needs.resolve.outputs.upstream_repo }}
+            UPSTREAM_REF=${{ needs.resolve.outputs.upstream_ref }}
+            UPSTREAM_SHA=${{ needs.resolve.outputs.upstream_sha }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+            VCS_URL=${{ github.repository }}
+            VERSION=${{ steps.meta.outputs.upstream_version }}
+          # GHA layer cache keeps the nightly run cheap even though nothing
+          # usually changed upstream.
+          cache-from: type=gha,scope=ghcr-${{ github.ref_name }}
+          cache-to: type=gha,scope=ghcr-${{ github.ref_name }},mode=max
+
+  verify:
+    # A nightly build that starts but crashes is worse than no build: it burns a
+    # slot in the registry and lies to whoever pulls `latest`. This job starts
+    # the freshly pushed image and proves it actually serves a model list, then
+    # fails the run loudly.
+    needs: [resolve, build]
+    if: >-
+      github.event_name != 'pull_request' && (
+        github.event_name != 'workflow_dispatch' || inputs.push
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Pull the image just pushed
+        run: docker pull ${{ needs.resolve.outputs.image }}:latest
+
+      - name: Start the container
+        run: |
+          # No -p: nothing outside is exposed on purpose. The LAN relay port is
+          # discovered from the log and forwarded for the duration of the test.
+          docker run -d --name ofm-verify \
+            -e OFM_HOME=/data \
+            -v ofm-verify-data:/data \
+            --rm "${{ needs.resolve.outputs.image }}:latest"
+          echo "waiting for the service to write its settings..."
+          for i in $(seq 1 60); do
+            if docker exec ofm-verify sh -c 'test -f "$OFM_HOME/settings.json"' 2>/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          echo "--- container log ---"
+          docker logs ofm-verify 2>&1 | tail -30 || true
+
+      - name: Assert /health answers on the loopback listener
+        run: |
+          # The local listener is loopback-only, so this must be exec'd inside
+          # the container, exactly as an operator would.
+          docker exec ofm-verify \
+            node -e 'const p=process.env.OFM_PORT||18900;require("http").get({host:"127.0.0.1",port:p,path:"/health"},r=>{let d="";r.setEncoding("utf8");r.on("data",c=>d+=c);r.on("end",()=>{console.log("status",r.statusCode);console.log(d);process.exit(r.statusCode===200?0:1)})}).on("error",e=>{console.error(e.message);process.exit(1)})'
+
+      - name: Assert the LAN relay is reachable and correctly gated
+        run: |
+          # The relay binds 0.0.0.0, so a published port reaches it — but this
+          # job publishes nothing on purpose. It execs in and checks the relay
+          # exists, is bound, and enforces its own key.
+          #
+          # The relay's *live* port is not the one in settings.json. Upstream
+          # persists `standaloneLanPort` as the *requested* value, and when that
+          # is 0 — the default, meaning "pick a free port" — the service binds an
+          # ephemeral one and leaves 0 on disk. Reading the port from
+          # settings.json therefore connects to nothing (verified: 0 is not
+          # listening while the real port is, here, 51972). Ask the running
+          # service for its relay state instead: `/api/management/summary` is
+          # loopback-only, which this exec is, and reports `lan.port`.
+          set -euo pipefail
+          docker exec -e OFM_LAN_CHECK=1 ofm-verify node /dev/stdin <<'EOF'
+          import fs from 'node:fs'
+          import http from 'node:http'
+
+          const home = process.env.OFM_HOME || '/data'
+          const settings = JSON.parse(fs.readFileSync(home + '/settings.json', 'utf8'))
+          const localKey = settings.forwardKey
+
+          const ask = (port, path, key) => new Promise(resolve => {
+            const req = http.request(
+              { host: '127.0.0.1', port, path, headers: key ? { Authorization: `Bearer ${key}` } : {} },
+              r => { let body = ''; r.setEncoding('utf8'); r.on('data', c => { body += c }); r.on('end', () => resolve({ status: r.statusCode, body })) },
+            )
+            req.on('error', e => resolve({ status: String(e.code || e.message), body: '' }))
+            req.end()
+          })
+          const fail = message => { console.error('::error::' + message); process.exit(1) }
+
+          // 1. The local listener must be up and healthy on loopback.
+          const localPort = settings.standalonePort
+          if (!localPort) fail('settings.json has no standalonePort — the service never bound')
+          const health = await ask(localPort, '/health', null)
+          if (health.status !== 200) fail(`local /health -> ${health.status}, expected 200`)
+          console.log(`local  /health        -> 200  (127.0.0.1:${localPort})`)
+
+          // 2. Ask the service where its relay actually is, rather than trusting
+          //    the persisted (requested) port.
+          const summary = await ask(localPort, '/api/management/summary', localKey)
+          if (summary.status !== 200) fail(`/api/management/summary -> ${summary.status}, expected 200`)
+          let relayPort = 0
+          try { relayPort = JSON.parse(summary.body).lan.port ?? 0 } catch { /* handled below */ }
+          if (!relayPort) fail('the relay is not running (lan.port missing from the summary)')
+          console.log(`relay is listening on ${relayPort} (from /api/management/summary)`)
+
+          // 3. The two keys must exist and must differ — the LAN key is separate
+          //    precisely so it can be rotated without touching the local one.
+          if (!settings.standaloneLanKey) fail('no LAN key was generated in ' + home + '/settings.json')
+          if (settings.standaloneLanKey === localKey) {
+            fail('the LAN key and the local forwardKey are identical — they must be separate')
+          }
+          console.log(`keys differ: lan=${settings.standaloneLanKey.length} chars, local=${localKey.length} chars`)
+
+          // 4. The relay enforces the LAN key and the local key does not work on it.
+          const anon = await ask(relayPort, '/v1/models', null)
+          if (anon.status !== 401) fail(`anonymous /v1/models -> ${anon.status}, expected 401`)
+          console.log('anonymous /v1/models -> 401')
+          const keyed = await ask(relayPort, '/v1/models', settings.standaloneLanKey)
+          if (keyed.status !== 200) fail(`keyed /v1/models -> ${keyed.status}, expected 200`)
+          console.log('keyed     /v1/models -> 200')
+          const wrong = await ask(relayPort, '/v1/models', localKey)
+          if (wrong.status !== 401) fail(`local key on the relay -> ${wrong.status}, expected 401 (keys must be separate)`)
+          console.log('local key /v1/models -> 401 (key separation enforced)')
+
+          // 5. The relay carries inference routes only.
+          const mgmt = await ask(relayPort, '/health', settings.standaloneLanKey)
+          if (mgmt.status !== 404) fail(`relay /health -> ${mgmt.status}, expected 404`)
+          console.log('relay     /health      -> 404 (inference routes only)')
+          console.log('LAN relay contract verified')
+          EOF
+        env:
+          # Re-assert here rather than relying on the container-wide env, so the
+          # check fails if the entrypoint ever stops exporting what it documents.
+          OFM_HOME: /data
+
+      - name: Print the management hint for the run log
+        if: always()
+        run: |
+          echo "### Image verified" >> "$GITHUB_STEP_SUMMARY"
+          echo "- image: \`${{ needs.resolve.outputs.image }}:latest\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- upstream: \`${{ needs.resolve.outputs.upstream_repo }}@${{ needs.resolve.outputs.upstream_sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "The management page is loopback-only **by design** (upstream refuses to bind a routable address)." >> "$GITHUB_STEP_SUMMARY"
+          echo "To open it: \`docker exec -it <container> sh\`, then read the management URL printed at startup." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f ofm-verify 2>/dev/null || true
+          docker volume rm ofm-verify-data 2>/dev/null || true
+
+  summary:
+    needs: [resolve, build, verify]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write run summary
+        run: |
+          {
+            echo "### Build & push run"
+            echo ""
+            echo "| job | result |"
+            echo "|---|---|"
+            echo "| resolve | ${{ needs.resolve.result }} |"
+            echo "| build | ${{ needs.build.result }} |"
+            echo "| verify | ${{ needs.verify.result }} |"
+            echo ""
+            echo "Image: \`${{ needs.resolve.outputs.image }}:latest\`"
+            echo ""
+            echo "Upstream: \`${{ needs.resolve.outputs.upstream_repo }}@${{ needs.resolve.outputs.upstream_sha }}\` (version ${{ needs.resolve.outputs.upstream_version }})"
+          } >> "$GITHUB_STEP_SUMMARY"

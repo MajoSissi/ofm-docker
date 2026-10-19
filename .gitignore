@@ -1,0 +1,20 @@
+# Probe scratch: the upstream tarball and its extracted tree. Never part of the
+# image — `download.mjs` and `verify.mjs` recreate it on demand.
+_probe/
+*.tar
+*.tar.gz
+
+# Local container state, if you build here.
+/data/
+*.log
+
+# Written by run-workflow-verify.mjs into the upstream tree so the workflow's
+# own verify script runs in the same ESM module mode the container gives it.
+verify-in-container.mjs
+verify-in-container.cjs
+
+# Editor
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
