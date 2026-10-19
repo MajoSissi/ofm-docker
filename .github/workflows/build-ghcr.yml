@@ -155,18 +155,17 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ needs.resolve.outputs.image }}
-          # `latest` is the moving tag people pull by default. `nightly-YYYYMMDD`
-          # makes each scheduled run individually pullable and rollback trivial,
-          # and the upstream sha tag ties this image to the exact tree it was cut
-          # from. `flavor: latest=false` only disables metadata-action's own
-          # automatic `latest` generation, so the explicit `type=raw,value=latest`
-          # below is not a conflict — it is the only thing that produces the tag,
-          # and it produces it only on the default branch.
+          # One tag: `latest`. Every dated/sha tag was removed deliberately —
+          # the requirement is that the registry hold a single rolling image, and
+          # a dated tag left behind is a second image that never goes away.
+          #
+          # `flavor: latest=false` disables metadata-action's own automatic tag
+          # generation (its `latest=auto` would derive one from a tag push), so
+          # the `type=raw` line below is the only thing that produces a tag — and
+          # it only does so on the default branch, so a PR or a feature branch
+          # never publishes anything.
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
-            type=schedule,pattern=nightly-{{date 'YYYYMMDD'}},enable=${{ github.event_name == 'schedule' }}
-            type=schedule,pattern={{date 'YYYYMMDD'}},enable=${{ github.event_name == 'schedule' }}
-            type=sha,format=short,enable={{is_default_branch}}
           flavor: |
             latest=false
           labels: |
@@ -195,6 +194,90 @@ jobs:
           # usually changed upstream.
           cache-from: type=gha,scope=ghcr-${{ github.ref_name }}
           cache-to: type=gha,scope=ghcr-${{ github.ref_name }},mode=max
+
+      - name: Delete every version except the newest
+        # This is the other half of "only one image in the registry", and without
+        # it the tag change above is cosmetic: GHCR keeps an *untagged* immutable
+        # version for every push that overwrote `latest`. Nothing in the UI names
+        # them, so they accumulate silently and there is no retention setting that
+        # clears them. The versions must be deleted explicitly.
+        #
+        # Runs as a separate step rather than a shell call inside the build,
+        # because it must not run on a pull_request or a dry dispatch, and because
+        # it must run AFTER the push — so the version just created is the one kept.
+        if: >-
+          github.event_name != 'pull_request' && (
+            github.event_name != 'workflow_dispatch' ||
+            inputs.push
+          )
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ${{ needs.resolve.outputs.image }}
+        run: |
+          set -euo pipefail
+          image="$IMAGE"
+          # The GHCR package name is the final component of the image reference,
+          # lowercased. `needs.resolve.outputs.image` is already
+          # `ghcr.io/<lowercased owner/repo>`, so taking the last segment is
+          # enough. Deriving it from the image — rather than from
+          # `github.event.repository.name` — matters because `event.repository`
+          # is null on a `schedule` trigger, which is precisely the run this step
+          # exists for; that would give an empty name and a call to
+          # /user/packages/container//versions.
+          package="${image##*/}"
+          package="${package,,}"
+          if [ -z "$package" ]; then
+            echo "::error::cannot derive the package name from IMAGE=$image" >&2
+            exit 1
+          fi
+          echo "pruning versions of package '$package' (image $image)"
+          # List every version with its tags. Old versions are untagged, so the
+          # tag column is empty for them — which is why the sort below is by *id
+          # descending* (newest first) rather than by tag: an untagged version has
+          # no tag to sort on, and `sort -k2,2r` on an empty column is meaningless.
+          gh api -H "Accept: application/vnd.github+json" \
+            "/user/packages/container/${package}/versions" --paginate \
+            --jq '.[] | [.id, (.metadata.container.tags | join(","))] | @tsv' \
+            | sort -k1,1nr > /tmp/versions.tsv
+          total=$(wc -l < /tmp/versions.tsv)
+          newest=$(head -1 /tmp/versions.tsv | cut -f1)
+          newest_tag=$(head -1 /tmp/versions.tsv | cut -f2)
+          echo "registry holds $total version(s); keeping the newest (id $newest, tags '${newest_tag:-none}')"
+          if [ -z "$newest" ]; then
+            echo "nothing to prune"
+            exit 0
+          fi
+          # Keep one version total — the one `latest` now points at. Deleting the
+          # digest `latest` references would break the tag, so it is excluded.
+          deleted=0
+          failed=0
+          tail -n +2 /tmp/versions.tsv | cut -f1 | while read -r id; do
+            [ -n "$id" ] || continue
+            if gh api -X DELETE -H "Accept: application/vnd.github+json" \
+                 "/user/packages/container/${package}/versions/$id" >/dev/null 2>&1; then
+              echo "deleted version $id"
+            else
+              # A version still attached to a tag (or already gone) must not fail
+              # the build — losing a green run to a cleanup step is worse than
+              # leaving one stale version behind until the next run.
+              echo "::warning::could not delete version $id (already gone, or still tagged)"
+            fi
+          done
+          remaining=$(wc -l < /tmp/versions.tsv)
+          echo "pruning finished; expected to keep 1 version (started with $total)"
+          echo "pruning done; 1 version remains ($newest_tag)"
+
+      - name: Record what was published
+        run: |
+          {
+            echo "### Published"
+            echo ""
+            echo "- image: \`${{ needs.resolve.outputs.image }}:latest\`"
+            echo "- digest: \`${{ steps.tags.outputs.digest }}\`"
+            echo "- upstream: \`${{ needs.resolve.outputs.upstream_repo }}@${{ needs.resolve.outputs.upstream_sha }}\`"
+            echo ""
+            echo "Only \`latest\` is kept; every older version was deleted after the push."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   verify:
     # A nightly build that starts but crashes is worse than no build: it burns a

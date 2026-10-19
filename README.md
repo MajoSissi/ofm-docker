@@ -19,7 +19,7 @@ container wants.
 | **Triggers** | `schedule` (daily 02:17 UTC) · `workflow_dispatch` (manual) · `push` to `main` (image-affecting paths) · `pull_request` (dry build, no push) |
 | **Registry** | `ghcr.io/<owner>/<repo>` |
 | **Platforms** | `linux/amd64` only |
-| **Tags** | `latest`, `nightly-YYYYMMDD`, `YYYYMMDD`, `sha-<short>` |
+| **Tags** | `latest` only — every older version is deleted after each push |
 | **Auth** | `GITHUB_TOKEN` with `permissions: packages: write` — no PAT needed |
 
 The workflow is deliberately thin: it resolves the upstream ref to an immutable
@@ -33,6 +33,40 @@ not force workflow changes.
 moments (label step, build step, verify step) can produce three different
 images, and a `latest` tag that does not match whatever the user pulls. The
 `resolve` job pins the SHA once and every later job builds that same tree.
+
+### Only `latest` exists — and why that needs two things
+
+One tag is published: `latest`. There are no dated tags and no `sha-` tags.
+
+What is easy to miss is that **publishing only `latest` does not keep the
+registry to one image.** GHCR versions are immutable: each push that overwrites
+`latest` leaves the previous digest behind as an *untagged* version. The package
+page then shows one tag while holding N versions' worth of layers, none of them
+named, and there is no retention setting in GitHub's UI that clears them.
+
+So the workflow does both:
+
+1. **Zero extra tags** — `docker/metadata-action` is configured with a single
+   `type=raw,value=latest` line and `flavor: latest=false` (which only disables
+   metadata-action's own auto-`latest`; the explicit line is what produces it).
+2. **Explicit GC** — after the push, a step lists every version through
+   `GET /user/packages/container/<name>/versions`, sorts by id descending, and
+   deletes all but the newest.
+
+Two details in that step are worth knowing:
+
+- It runs **after** the push, so the version just created is the one kept.
+  Running it before would delete the live digest.
+- A deletion that fails (a version still carrying a tag, or already gone) emits a
+  `::warning::` rather than failing the run. Losing a green build to a cleanup
+  step is worse than one stale version surviving until the next nightly.
+
+It is skipped on `pull_request` and on a dry `workflow_dispatch`, so an
+unpushed build never touches the registry.
+
+> Rollback is therefore *not* `docker pull some-older-tag` — there is nothing
+> older to pull. To roll back, re-run the build against an older upstream ref:
+> `workflow_dispatch` with `upstream_ref` set to the previous version tag.
 
 ---
 

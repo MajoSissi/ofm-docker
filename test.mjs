@@ -20,7 +20,7 @@ import process from 'node:process'
 const steps = [
   ['Download the upstream tree', 'download.mjs'],
   ['Verify the packaging', 'verify.mjs'],
-  ['Run the workflow\'s verify script', 'run-workflow-verify.mjs'],
+  ["Run the workflow's verify script", 'run-workflow-verify.mjs'],
   ['Check verify.mjs catches the entrypoint bug', 'test-verify-discriminates.mjs'],
   ['Test the entrypoint helpers', 'test-entrypoint-helpers.mjs'],
 ]

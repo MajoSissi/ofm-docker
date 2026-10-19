@@ -1,38 +1,38 @@
-# Our Free Model — standalone service in a container.
+# Our Free Model — 容器内独立服务
 #
-# Only the LAN relay is published. The plain service port is loopback-only by
-# upstream design and therefore cannot be published at all — see README.md,
-# "Ports, and the one that cannot be published".
+# 只发布 LAN 中继端口。普通服务端口按上游设计只绑回环，根本无法从容器外访问，
+# 详见 README.md 的「端口，以及那个无法发布的端口」一节。
 #
-# OFM_LAN_PORT is pinned to 18901 here so the published port and the relay's
-# own port are the same number. A fixed port that happens to be taken does not
-# stop the service: upstream degrades to `relayError` (surfaced on the summary
-# route and the CLI) and keeps serving inference locally, while `-p` simply
-# forwards to nothing.
+# OFM_LAN_PORT 在这里固定为 18901，让对外映射端口和中继自身端口是同一个号。
+# 若该固定端口已被占用，服务不会因此退出：上游会降级为 `relayError`（在摘要
+# 接口和 CLI 里都能看到），本地推理照常工作，只是 `-p` 转发不到东西而已。
 
 services:
   our-free-model:
     image: ghcr.io/${IMAGE_NAMESPACE:-owner}/dsh-our-free-model:latest
     container_name: ofm
     restart: unless-stopped
-    # Bound to loopback on purpose. Anyone who can hold the LAN key gets the
-    # free lanes from this machine's egress; publishing on 0.0.0.0 hands them
-    # to whoever can route to this host.
+    # 特意只绑 127.0.0.1：谁拿到 LAN Key，谁就能从本机出口用这些免费车道；
+    # 绑到 0.0.0.0 等于把它送给所有能路由到这台机器的人。
     ports:
       - "127.0.0.1:18901:18901"
+    # 数组写法：和 `environment` 的映射写法等价，但每行一个、行内自带注释，
+    # 不容易在改动时把相邻两行并成一行。
     environment:
-      OFM_HOME: /data
-      OFM_PORT: "18900"      # loopback only — never published
-      OFM_LAN_PORT: "18901"  # the relay, the only externally reachable port
-      OFM_ENABLE_REFRESH: "1"
+      - OFM_HOME=/data
+      # 回环监听，永不对外发布
+      - OFM_PORT=18900
+      # 中继端口，唯一能从容器外访问的入口
+      - OFM_LAN_PORT=18901
+      # 置 0 可关闭启动刷新（离线 / CI），账号渠道任务不受影响
+      - OFM_ENABLE_REFRESH=1
     volumes:
-      # Everything the service remembers: settings, the API key, the LAN key,
-      # cached model catalog, channel accounts, usage stats. Losing this
-      # loses the LAN key and every configured channel.
+      # 服务记住的一切：设置、API Key、LAN Key、模型目录缓存、账号渠道、用量
+      # 统计。丢掉这个卷，等于丢掉 LAN Key 和所有已配置渠道。
       - ofm-data:/data
     healthcheck:
-      # /health answers on the loopback listener from inside the container,
-      # which this container can always reach itself.
+      # /health 由回环监听应答，容器自己总能访问到，所以这个探针有效，
+      # 也不可能被宿主网络上无关的进程满足。
       test:
         - CMD
         - node
@@ -47,8 +47,8 @@ services:
       start_period: 20s
       retries: 3
     logging:
-      # The LAN key is printed once at first start, so the log is where an
-      # operator reads it from. Keep it out of public log sinks.
+      # LAN Key 只在首次启动时打印一次，日志就是运维读取它的地方。
+      # 别把日志送去公开的日志收集端。
       driver: json-file
       options:
         max-size: "10m"
