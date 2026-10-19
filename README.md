@@ -16,11 +16,25 @@ container wants.
 
 | | |
 |---|---|
-| **Triggers** | `schedule` (daily 02:17 UTC) · `workflow_dispatch` (manual) · `push` to `main` (image-affecting paths) · `pull_request` (dry build, no push) |
-| **Registry** | `ghcr.io/<owner>/<repo>` |
+| **Triggers** | `schedule` (daily) · `workflow_dispatch` (manual) · `push` to `main` (image-affecting paths) · `pull_request` (dry build, no push) |
+| **Registry** | `ghcr.io/majosissi/ofm-docker` — public, **no `docker login` needed to pull** |
 | **Platforms** | `linux/amd64` only |
 | **Tags** | `latest` only — every older version is deleted after each push |
-| **Auth** | `GITHUB_TOKEN` with `permissions: packages: write` — no PAT needed |
+| **Push auth** | `GITHUB_TOKEN` with `permissions: packages: write` — no PAT needed |
+
+> **Pulling needs no login; only pushing does.** The package is public. If a
+> `docker pull` on a fresh host fails with `manifest unknown`, the cause is
+> almost always one of:
+>
+> 1. **The wrong name.** The package is `ofm-docker` (the repository name), *not*
+>    `dsh-our-free-model` (the upstream project name). GHCR names a package after
+>    the last segment of the image path.
+> 2. **Stale credentials on the host.** A leftover `ghcr.io` login in
+>    `~/.docker/config.json` whose token has since been deleted or expired turns
+>    an anonymous pull that would have succeeded into a denial that Docker
+>    reports as `manifest unknown`. Fix: `docker logout ghcr.io`, then pull again.
+> 3. The package was made private by hand (*Package settings → Change
+>    visibility*), which the workflow never does.
 
 The workflow is deliberately thin: it resolves the upstream ref to an immutable
 SHA, hands that SHA to the Dockerfile as a build arg, and stops deciding
@@ -72,11 +86,25 @@ unpushed build never touches the registry.
 
 ## Quick start
 
+**No `docker login` needed — the package is public.**
+
 ```bash
 docker run -d --name ofm \
   -v ofm-data:/data \
-  ghcr.io/<owner>/<repo>:latest
+  ghcr.io/majosissi/ofm-docker:latest
 ```
+
+Two things about that name that are worth knowing, because both have caused a
+failed pull:
+
+- **`ofm-docker`, not `dsh-our-free-model`.** A GHCR package is named after the
+  *last segment* of the image path, and this workflow pushes `ghcr.io/<repo>`, so
+  the package follows the **repository** name. Upstream's project is
+  `dsh-our-free-model`; this repository that packages it is `ofm-docker`, so the
+  package is `ghcr.io/majosissi/ofm-docker`. Pulling the project name gives
+  `manifest unknown` on a package that is visible and working.
+- **`majosissi`** is the publishing account. Fork this repo and the same workflow
+  pushes to your own namespace instead.
 
 Then read the key out of the log and call it:
 
@@ -89,12 +117,12 @@ To get a fixed, publishable port instead of the default dynamic one:
 
 ```bash
 docker run -d --name ofm \
-  -p 18901:18901 \
+  -p 127.0.0.1:18901:18901 \
   -e OFM_LAN_PORT=18901 \
   -v ofm-data:/data \
-  ghcr.io/<owner>/<repo>:latest
+  ghcr.io/majosissi/ofm-docker:latest
 
-curl -s http://localhost:18901/v1/models \
+curl -s http://127.0.0.1:18901/v1/models \
   -H "Authorization: Bearer <LAN key from the log>"
 ```
 
@@ -257,7 +285,8 @@ The image solves this two ways:
 For a stable, publishable port, set it explicitly:
 
 ```bash
-docker run -p 18901:18901 -e OFM_LAN_PORT=18901 -v ofm-data:/data ghcr.io/<owner>/<repo>:latest
+docker run -p 127.0.0.1:18901:18901 -e OFM_LAN_PORT=18901 \
+  -v ofm-data:/data ghcr.io/majosissi/ofm-docker:latest
 ```
 
 A fixed port that is already taken is **not** fatal: upstream degrades to

@@ -105,8 +105,21 @@ jobs:
         run: |
           # GHCR image references must be all-lowercase; `github.repository`
           # inherits the owner's casing, which may not be.
+          #
+          # This is also where the package name is decided, and it is worth being
+          # explicit about it: GHCR names a package after the LAST segment of the
+          # image path. Pushing to ghcr.io/<owner>/<repo> therefore creates a
+          # package called <repo> — here `ofm-docker` — and NOT the upstream
+          # project's name (`dsh-our-free-model`). Pulling the project name gets
+          # `manifest unknown` on a package that is fine. Everything downstream
+          # (the verify job's pull, the prune step's package lookup, the docs)
+          # must use this same path.
           echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
           echo "image: ghcr.io/${GITHUB_REPOSITORY,,}"
+          # The package name for the GHCR versions API, derived rather than
+          # hardcoded, so a fork publishes and prunes its own package.
+          echo "package=${GITHUB_REPOSITORY##*/}" >> "$GITHUB_OUTPUT"
+          echo "package: ${GITHUB_REPOSITORY##*/}"
 
   build:
     needs: resolve

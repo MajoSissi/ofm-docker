@@ -9,7 +9,15 @@
 
 services:
   our-free-model:
-    image: ghcr.io/${IMAGE_NAMESPACE:-owner}/dsh-our-free-model:latest
+    # 这个包是 public 的，拉取不需要 docker login，也不需要 PAT。
+    #
+    # 注意名字是 `majosissi/ofm-docker`，不是 `dsh-our-free-model`。GHCR 的包名取
+    # 自镜像路径的最后一段，而 workflow 推的是 ghcr.io/<仓库名>，仓库叫 ofm-docker，
+    # 所以包就叫 ofm-docker —— 跟上游项目名 dsh-our-free-model 没有关系。曾经这里有
+    # 过一个错误的默认值，拼出一个不存在的仓库，拉取时报 manifest unknown。
+    #
+    # ${IMAGE_NAMESPACE} 留给你 fork 后改成自己的命名空间；默认 majosissi 是上游发布者。
+    image: ghcr.io/${IMAGE_NAMESPACE:-majosissi}/ofm-docker:latest
     container_name: ofm
     restart: unless-stopped
     # 特意只绑 127.0.0.1：谁拿到 LAN Key，谁就能从本机出口用这些免费车道；
