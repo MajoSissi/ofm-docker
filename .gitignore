@@ -1,6 +1,7 @@
 # Probe scratch: the upstream tarball and its extracted tree. Never part of the
 # image — `download.mjs` and `verify.mjs` recreate it on demand.
 _probe/
+.probe2/
 *.tar
 *.tar.gz
 

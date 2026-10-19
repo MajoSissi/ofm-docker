@@ -213,6 +213,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           IMAGE: ${{ needs.resolve.outputs.image }}
+          KEEP_TAG: latest
         run: |
           set -euo pipefail
           image="$IMAGE"
@@ -231,41 +232,63 @@ jobs:
             exit 1
           fi
           echo "pruning versions of package '$package' (image $image)"
-          # List every version with its tags. Old versions are untagged, so the
-          # tag column is empty for them — which is why the sort below is by *id
-          # descending* (newest first) rather than by tag: an untagged version has
-          # no tag to sort on, and `sort -k2,2r` on an empty column is meaningless.
+
+          # Which version to keep is decided by TAG, never by position.
+          #
+          # The first version of this step sorted by id descending and deleted
+          # everything but row 1. That is wrong twice over: GHCR version ids are
+          # opaque integers with no documented ordering, so "highest id == newest"
+          # is a guess; and the one version that matters is the one carrying the
+          # `latest` tag, which is exactly the version that must survive. Deleting
+          # it leaves `latest` pointing at nothing, and the verify job then fails
+          # with `manifest unknown` — a message that names no cause, because the
+          # push and the deletion both "succeeded".
           gh api -H "Accept: application/vnd.github+json" \
             "/user/packages/container/${package}/versions" --paginate \
-            --jq '.[] | [.id, (.metadata.container.tags | join(","))] | @tsv' \
-            | sort -k1,1nr > /tmp/versions.tsv
+            --jq '.[] | [.id, (.metadata.container.tags // [] | join(","))] | @tsv' \
+            > /tmp/versions.tsv
+
           total=$(wc -l < /tmp/versions.tsv)
-          newest=$(head -1 /tmp/versions.tsv | cut -f1)
-          newest_tag=$(head -1 /tmp/versions.tsv | cut -f2)
-          echo "registry holds $total version(s); keeping the newest (id $newest, tags '${newest_tag:-none}')"
-          if [ -z "$newest" ]; then
-            echo "nothing to prune"
-            exit 0
+          echo "registry holds $total version(s)"
+
+          # The version carrying KEEP_TAG is the one to preserve.
+          keep_id=$(awk -F'\t' -v want="$KEEP_TAG" \
+            'BEGIN{FS="\t"} { n=split($2, a, ","); for (i=1;i<=n;i++) if (a[i]==want) { print $1; exit } }' \
+            /tmp/versions.tsv)
+          if [ -z "$keep_id" ]; then
+            # Nothing is tagged. That is a broken state, not a cleanup opportunity:
+            # if we started deleting now we could remove the only copy.
+            echo "::error::no version carries the '$KEEP_TAG' tag — refusing to prune, because the publish is broken" >&2
+            awk -F'\t' '{print "  id="$1" tags="$2}' /tmp/versions.tsv
+            exit 1
           fi
-          # Keep one version total — the one `latest` now points at. Deleting the
-          # digest `latest` references would break the tag, so it is excluded.
+          echo "keeping version $keep_id (tagged '$KEEP_TAG')"
+
           deleted=0
           failed=0
-          tail -n +2 /tmp/versions.tsv | cut -f1 | while read -r id; do
+          while IFS=$'\t' read -r id tags; do
             [ -n "$id" ] || continue
+            [ "$id" = "$keep_id" ] && continue
+            # Belt and braces: never delete a version that still carries ANY tag,
+            # even if it is not the one we are keeping. A tagged version is one
+            # somebody may be pulling deliberately.
+            if [ -n "$tags" ]; then
+              echo "::warning::version $id is tagged ($tags) — leaving it alone; only untagged versions are pruned"
+              failed=$((failed + 1))
+              continue
+            fi
             if gh api -X DELETE -H "Accept: application/vnd.github+json" \
                  "/user/packages/container/${package}/versions/$id" >/dev/null 2>&1; then
+              deleted=$((deleted + 1))
               echo "deleted version $id"
             else
-              # A version still attached to a tag (or already gone) must not fail
-              # the build — losing a green run to a cleanup step is worse than
-              # leaving one stale version behind until the next run.
-              echo "::warning::could not delete version $id (already gone, or still tagged)"
+              failed=$((failed + 1))
+              # A deletion that fails must not fail the build: losing a green run
+              # to a cleanup step is worse than one stale version surviving.
+              echo "::warning::could not delete version $id (already gone, or not deletable)"
             fi
-          done
-          remaining=$(wc -l < /tmp/versions.tsv)
-          echo "pruning finished; expected to keep 1 version (started with $total)"
-          echo "pruning done; 1 version remains ($newest_tag)"
+          done < /tmp/versions.tsv
+          echo "pruned $deleted version(s), kept 1 ($KEEP_TAG); $failed left in place"
 
       - name: Record what was published
         run: |
